@@ -114,6 +114,7 @@ const volatile struct {
 	u64 my_ino;
 	u32 collect_pystacks;
 	u32 collect_syscalls;
+	u32 collect_syscall_summary;
 	u32 confidentiality_mode;
 	u64 wakeup_data_size;  /* Ringbuf fill threshold for wakeup (0 = default) */
 	u32 marker_syscall_nr; /* Syscall number for marker events (0 = disabled) */
@@ -747,6 +748,40 @@ struct {
 	__type(value, struct tw_pending_info);
 	__uint(max_entries, 1);
 } pending_tw SEC(".maps");
+
+/* syscall-summary recorder: in-kernel per-(thread, syscall) aggregation. Both
+ * maps autocreate off unless collect_syscall_summary is set. */
+struct syscall_key {
+	u32 tgid;
+	u32 tid;
+	u32 nr;
+};
+struct syscall_stat {
+	u64 count;
+	u64 total_ns;
+	u64 max_ns;
+};
+struct syscall_enter_val {
+	u64 ts;
+	u32 nr;
+};
+
+/* sys_enter stashes a start ts here keyed by pid_tgid; LRU so a task that
+ * never hits sys_exit (or is evicted) simply loses that one call. */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, u64); /* bpf_get_current_pid_tgid() */
+	__type(value, struct syscall_enter_val);
+	__uint(max_entries, 1 << 16);
+} syscall_enter SEC(".maps");
+
+/* Per-CPU so sys_exit updates need no locking; userspace sums across CPUs. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__type(key, struct syscall_key);
+	__type(value, struct syscall_stat);
+	__uint(max_entries, 1 << 16);
+} syscall_stats SEC(".maps");
 
 #define MISSED_SCHED_EVENT 0
 #define MISSED_STACK_EVENT 1
@@ -2906,6 +2941,13 @@ int tracepoint__raw_syscalls__sys_enter(struct trace_event_raw_sys_enter *ctx)
 			handle_marker_event(ctx, task);
 	}
 
+	if (tool_config.collect_syscall_summary) {
+		struct syscall_enter_val v = { .ts = bpf_ktime_get_boot_ns(),
+					       .nr = (u32)ctx->id };
+		u64 pid_tgid = bpf_get_current_pid_tgid();
+		bpf_map_update_elem(&syscall_enter, &pid_tgid, &v, BPF_ANY);
+	}
+
 	if (!tool_config.collect_syscalls)
 		return 0;
 
@@ -2932,11 +2974,41 @@ int tracepoint__raw_syscalls__sys_enter(struct trace_event_raw_sys_enter *ctx)
 SEC("tracepoint/raw_syscalls/sys_exit")
 int tracepoint__raw_syscalls__sys_exit(struct trace_event_raw_sys_exit *ctx)
 {
-	if (!tool_config.collect_syscalls)
+	if (!tool_config.collect_syscalls && !tool_config.collect_syscall_summary)
 		return 0;
 
 	struct task_struct *task = bpf_get_current_task_btf();
 	if (!trace_task(task))
+		return 0;
+
+	if (tool_config.collect_syscall_summary) {
+		u64 pid_tgid = bpf_get_current_pid_tgid();
+		struct syscall_enter_val *e =
+			bpf_map_lookup_elem(&syscall_enter, &pid_tgid);
+		if (e) {
+			u64 dur = bpf_ktime_get_boot_ns() - e->ts;
+			struct syscall_key k = { .tgid = (u32)(pid_tgid >> 32),
+						 .tid = (u32)pid_tgid,
+						 .nr = e->nr };
+			bpf_map_delete_elem(&syscall_enter, &pid_tgid);
+			struct syscall_stat *s =
+				bpf_map_lookup_elem(&syscall_stats, &k);
+			if (s) {
+				s->count += 1;
+				s->total_ns += dur;
+				if (dur > s->max_ns)
+					s->max_ns = dur;
+			} else {
+				struct syscall_stat init = { .count = 1,
+							     .total_ns = dur,
+							     .max_ns = dur };
+				bpf_map_update_elem(&syscall_stats, &k, &init,
+						    BPF_ANY);
+			}
+		}
+	}
+
+	if (!tool_config.collect_syscalls)
 		return 0;
 
 	long flags;
