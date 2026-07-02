@@ -134,7 +134,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 31;
+pub const SCHEMA_VERSION: u32 = 32;
 
 /// The systing version that writes `_traces.systing_version`. A constant so
 /// the tools built on the library (`systing-heap`) record the same version
@@ -189,6 +189,7 @@ pub const DATA_TABLES: &[&str] = &[
     "heap_snapshot",
     "heap_sample",
     "heap_live_read",
+    "syscall_summary",
     "clock_snapshot",
     "sysinfo",
     "cpu_info",
@@ -250,6 +251,7 @@ pub const PARQUET_TABLES: &[(&str, ParquetFileOf)] = &[
     ("task_stack_event", |p| &p.task_stack_event),
     ("task_context", |p| &p.task_context),
     ("go_labels", |p| &p.go_labels),
+    ("syscall_summary", |p| &p.syscall_summary),
     ("clock_snapshot", |p| &p.clock_snapshot),
     ("sysinfo", |p| &p.sysinfo),
     ("cpu_info", |p| &p.cpu_info),
@@ -885,6 +887,18 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             value_start BIGINT,
             ts_end BIGINT,
             value_end BIGINT
+        );
+        CREATE TABLE IF NOT EXISTS syscall_summary (
+            trace_id VARCHAR,
+            upid BIGINT,
+            utid BIGINT,
+            pid INTEGER,
+            tid INTEGER,
+            syscall_nr INTEGER,
+            syscall_name VARCHAR,
+            count BIGINT,
+            total_ns BIGINT,
+            max_ns BIGINT
         );
         CREATE TABLE IF NOT EXISTS clock_snapshot (
             trace_id VARCHAR,

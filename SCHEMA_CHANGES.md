@@ -445,6 +445,19 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 32 (systing 1.29.0) — 2026-10-21
+
+Added the `syscall_summary` table for the new `syscall-summary` recorder, which
+aggregates syscall count and timing in-BPF instead of streaming every call.
+Populated only with `--add-recorder syscall-summary`.
+
+### Added tables
+- `syscall_summary` — per-`(process, thread, syscall)` aggregate: `upid BIGINT`,
+  `utid BIGINT`, `pid INTEGER`, `tid INTEGER`, `syscall_nr INTEGER`,
+  `syscall_name VARCHAR`, `count BIGINT`, `total_ns BIGINT`, `max_ns BIGINT`. One
+  row per traced thread and syscall number; `count`/`total_ns` are summed across
+  CPUs, `max_ns` is the slowest single call.
+
 ## Schema Version 31 (systing 1.28.0) — 2026-10-14
 
 The task-stacks recorder says what each thread was waiting in, beside where
