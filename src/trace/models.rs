@@ -976,6 +976,21 @@ pub struct MemoryVmstatRecord {
     pub value_end: i64,
 }
 
+/// Per-(process,thread,syscall) aggregate produced in-BPF and read once at
+/// stop time. `trace_id` is injected at import, not stored here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyscallSummaryRecord {
+    pub upid: i64,
+    pub utid: i64,
+    pub pid: i32,
+    pub tid: i32,
+    pub syscall_nr: i32,
+    pub syscall_name: String,
+    pub count: i64,
+    pub total_ns: i64,
+    pub max_ns: i64,
+}
+
 #[derive(Debug, Default)]
 pub struct ExtractedData {
     pub processes: Vec<ProcessRecord>,
@@ -1014,6 +1029,7 @@ pub struct ExtractedData {
     pub task_stack_events: Vec<TaskStackEventRecord>,
     pub task_contexts: Vec<TaskContextRecord>,
     pub go_labels: Vec<GoLabelRecord>,
+    pub syscall_summaries: Vec<SyscallSummaryRecord>,
     pub clock_snapshots: Vec<ClockSnapshotRecord>,
     pub sysinfo: Option<SysInfoRecord>,
     pub cpu_infos: Vec<CpuInfoRecord>,

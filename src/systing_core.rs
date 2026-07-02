@@ -6971,6 +6971,10 @@ pub fn systing(
                 .unwrap()
                 .load_socket_metadata(&skel.maps.socket_metadata_map);
         }
+        // Read the in-BPF syscall aggregation while skel (and its maps) is alive.
+        if opts.syscall_summary {
+            recorder.load_syscall_summary(&skel.maps.syscall_stats);
+        }
 
         // Make the implicit end-of-scope teardown an explicit, bracketed
         // step: detaching the programs (probe links, then the skeleton's own

@@ -294,6 +294,9 @@ pub struct SessionRecorder {
     /// How `--include-go-context` ran (`sysinfo.go_context`): `on` or
     /// `restricted`, set when it starts. Unset without the flag.
     pub go_context: OnceLock<&'static str>,
+    /// Per-(thread, syscall) aggregates read once from the BPF syscall_stats
+    /// map at stop time, drained into the writer in generate_parquet_trace.
+    syscall_summaries: Mutex<Vec<crate::trace::SyscallSummaryRecord>>,
 }
 
 pub fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -1029,6 +1032,62 @@ impl SessionRecorder {
             network_recorder_config: OnceLock::new(),
             task_stacks_remote_reads: OnceLock::new(),
             go_context: OnceLock::new(),
+            syscall_summaries: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Read the per-CPU `syscall_stats` BPF map once, at stop time while the
+    /// skeleton is still loaded, and buffer one resolved row per
+    /// (process, thread, syscall). Per-CPU counts/times are summed and the
+    /// per-CPU max reduced; upid/utid come from the shared generator so the
+    /// rows join the process/thread tables. `syscall_enter` is never read here.
+    pub fn load_syscall_summary<M: libbpf_rs::MapCore>(&self, map: &M) {
+        use crate::systing_core::types::{syscall_key, syscall_stat};
+
+        for key in map.keys() {
+            if key.len() < std::mem::size_of::<syscall_key>() {
+                continue;
+            }
+            let per_cpu = match map.lookup_percpu(&key, libbpf_rs::MapFlags::ANY) {
+                Ok(Some(values)) => values,
+                _ => continue,
+            };
+            // SAFETY: keys()/lookup_percpu return buffers sized to the map's
+            // key/value types; this pointer cast mirrors load_socket_metadata.
+            let k: &syscall_key = unsafe { &*(key.as_ptr() as *const syscall_key) };
+
+            let mut count: u64 = 0;
+            let mut total_ns: u64 = 0;
+            let mut max_ns: u64 = 0;
+            for cpu_bytes in &per_cpu {
+                if cpu_bytes.len() < std::mem::size_of::<syscall_stat>() {
+                    continue;
+                }
+                let stat: &syscall_stat = unsafe { &*(cpu_bytes.as_ptr() as *const syscall_stat) };
+                count += stat.count;
+                total_ns += stat.total_ns;
+                max_ns = max_ns.max(stat.max_ns);
+            }
+            if count == 0 {
+                continue;
+            }
+
+            let upid = self.utid_generator.get_or_create_upid(k.tgid as i32);
+            let utid = self.utid_generator.get_or_create_utid(k.tid as i32);
+            self.syscall_summaries
+                .lock()
+                .unwrap()
+                .push(crate::trace::SyscallSummaryRecord {
+                    upid,
+                    utid,
+                    pid: k.tgid as i32,
+                    tid: k.tid as i32,
+                    syscall_nr: k.nr as i32,
+                    syscall_name: crate::events::syscall_name(k.nr as u64),
+                    count: count as i64,
+                    total_ns: total_ns as i64,
+                    max_ns: max_ns as i64,
+                });
         }
     }
 
@@ -1817,6 +1876,12 @@ impl SessionRecorder {
         }
         drop(py_thread_names);
 
+        // syscall-summary rows were read from the BPF map at stop time and
+        // buffered on self; drain them now that thread utids are assigned.
+        for record in self.syscall_summaries.lock().unwrap().drain(..) {
+            writer.add_syscall_summary(record)?;
+        }
+
         // Step 4: Generate network interface metadata
         eprintln!("Writing network interface metadata...");
         self.write_network_interface_records(&mut *writer)?;
@@ -2237,6 +2302,7 @@ mod tests {
             network_recorder_config: OnceLock::new(),
             task_stacks_remote_reads: OnceLock::new(),
             go_context: OnceLock::new(),
+            syscall_summaries: Mutex::new(Vec::new()),
         }
     }
 

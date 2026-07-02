@@ -35,8 +35,8 @@ use crate::trace::{
     NetworkInterfaceRecord, NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord,
     NetworkSyscallRecord, ProcessExitRecord, ProcessRecord, SchedMigrateRecord, SchedSliceRecord,
     SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord,
-    SysInfoRecord, TaskContextRecord, TaskStackEventRecord, ThreadRecord, ThreadStateRecord,
-    TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
+    SysInfoRecord, SyscallSummaryRecord, TaskContextRecord, TaskStackEventRecord, ThreadRecord,
+    ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -151,6 +151,7 @@ pub struct StreamingParquetWriter {
     task_stack_events: Vec<TaskStackEventRecord>,
     task_contexts: Vec<TaskContextRecord>,
     go_labels: Vec<GoLabelRecord>,
+    syscall_summaries: Vec<SyscallSummaryRecord>,
     clock_snapshots: Vec<ClockSnapshotRecord>,
     sysinfo: Option<SysInfoRecord>,
     cpu_infos: Vec<CpuInfoRecord>,
@@ -206,6 +207,7 @@ pub struct StreamingParquetWriter {
     task_stack_event_writer: Option<TableWriter>,
     task_context_writer: Option<TableWriter>,
     go_labels_writer: Option<TableWriter>,
+    syscall_summary_writer: Option<TableWriter>,
     clock_snapshot_writer: Option<TableWriter>,
     sysinfo_writer: Option<TableWriter>,
     cpu_info_writer: Option<TableWriter>,
@@ -294,6 +296,7 @@ impl StreamingParquetWriter {
             task_stack_events: Vec::new(),
             task_contexts: Vec::new(),
             go_labels: Vec::new(),
+            syscall_summaries: Vec::new(),
             clock_snapshots: Vec::new(),
             sysinfo: None,
             cpu_infos: Vec::new(),
@@ -337,6 +340,7 @@ impl StreamingParquetWriter {
             task_stack_event_writer: None,
             task_context_writer: None,
             go_labels_writer: None,
+            syscall_summary_writer: None,
             clock_snapshot_writer: None,
             sysinfo_writer: None,
             cpu_info_writer: None,
@@ -1262,6 +1266,24 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    fn flush_syscall_summary(&mut self) -> Result<()> {
+        if self.syscall_summaries.is_empty() {
+            return Ok(());
+        }
+        let schema = trace::syscall_summary_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.syscall_summary_writer,
+            &self.sink,
+            "syscall_summary",
+            schema.clone(),
+            &self.writer_props,
+        )?;
+        let batch = build_syscall_summary_batch(&self.syscall_summaries, &schema)?;
+        writer.write(&batch)?;
+        self.syscall_summaries.clear();
+        Ok(())
+    }
+
     // Flush tpu_devices buffer
     fn flush_tpu_devices(&mut self) -> Result<()> {
         if self.tpu_devices.is_empty() {
@@ -1391,6 +1413,7 @@ impl StreamingParquetWriter {
         close_writer!(self.task_stack_event_writer);
         close_writer!(self.task_context_writer);
         close_writer!(self.go_labels_writer);
+        close_writer!(self.syscall_summary_writer);
         close_writer!(self.clock_snapshot_writer);
         close_writer!(self.sysinfo_writer);
         close_writer!(self.cpu_info_writer);
@@ -1930,6 +1953,16 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn add_syscall_summary(&mut self, record: SyscallSummaryRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.syscall_summaries, self.batch_size);
+        self.syscall_summaries.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.syscall_summaries, self.batch_size) {
+            self.flush_syscall_summary()?;
+        }
+        Ok(())
+    }
+
     fn add_memory_fault(&mut self, record: MemoryFaultRecord) -> Result<()> {
         Self::reserve_if_empty(&mut self.memory_faults, self.batch_size);
         self.memory_faults.push(record);
@@ -2018,6 +2051,7 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_task_stack_events()?;
         self.flush_task_contexts()?;
         self.flush_go_labels()?;
+        self.flush_syscall_summary()?;
         self.flush_clock_snapshots()?;
         self.flush_sysinfo()?;
         self.flush_cpu_infos()?;
@@ -3439,6 +3473,48 @@ fn build_memory_vmstat_batch(
             Arc::new(value_start.finish()),
             Arc::new(ts_end.finish()),
             Arc::new(value_end.finish()),
+        ],
+    )?)
+}
+
+fn build_syscall_summary_batch(
+    records: &[SyscallSummaryRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    use arrow::array::{Int32Builder, Int64Builder};
+    let n = records.len();
+    let mut upid = Int64Builder::with_capacity(n);
+    let mut utid = Int64Builder::with_capacity(n);
+    let mut pid = Int32Builder::with_capacity(n);
+    let mut tid = Int32Builder::with_capacity(n);
+    let mut syscall_nr = Int32Builder::with_capacity(n);
+    let mut syscall_name = StringBuilder::with_capacity(n, n * 16);
+    let mut count = Int64Builder::with_capacity(n);
+    let mut total_ns = Int64Builder::with_capacity(n);
+    let mut max_ns = Int64Builder::with_capacity(n);
+    for r in records {
+        upid.append_value(r.upid);
+        utid.append_value(r.utid);
+        pid.append_value(r.pid);
+        tid.append_value(r.tid);
+        syscall_nr.append_value(r.syscall_nr);
+        syscall_name.append_value(&r.syscall_name);
+        count.append_value(r.count);
+        total_ns.append_value(r.total_ns);
+        max_ns.append_value(r.max_ns);
+    }
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(upid.finish()),
+            Arc::new(utid.finish()),
+            Arc::new(pid.finish()),
+            Arc::new(tid.finish()),
+            Arc::new(syscall_nr.finish()),
+            Arc::new(syscall_name.finish()),
+            Arc::new(count.finish()),
+            Arc::new(total_ns.finish()),
+            Arc::new(max_ns.finish()),
         ],
     )?)
 }

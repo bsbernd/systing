@@ -16,8 +16,8 @@ use crate::trace::{
     NetworkInterfaceRecord, NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord,
     NetworkSyscallRecord, ProcessExitRecord, ProcessRecord, SchedMigrateRecord, SchedSliceRecord,
     SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord,
-    SysInfoRecord, TaskContextRecord, TaskStackEventRecord, ThreadRecord, ThreadStateRecord,
-    TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
+    SysInfoRecord, SyscallSummaryRecord, TaskContextRecord, TaskStackEventRecord, ThreadRecord,
+    ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Trait for collecting trace records during recording.
@@ -167,6 +167,9 @@ pub trait RecordCollector {
     /// Add one label of one Go label set of one process
     /// (`--include-go-context`).
     fn add_go_label(&mut self, record: GoLabelRecord) -> Result<()>;
+
+    /// Add a per-syscall aggregate record.
+    fn add_syscall_summary(&mut self, record: SyscallSummaryRecord) -> Result<()>;
 
     /// Set the system info record (only one per trace).
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()>;
@@ -396,6 +399,7 @@ impl RecordCollector for SharedCollector {
         add_task_stack_event(TaskStackEventRecord),
         add_task_context(TaskContextRecord),
         add_go_label(GoLabelRecord),
+        add_syscall_summary(SyscallSummaryRecord),
         set_sysinfo(SysInfoRecord),
         add_cpu_info(CpuInfoRecord),
         add_tpu_device(TpuDeviceRecord),
@@ -651,6 +655,11 @@ impl RecordCollector for InMemoryCollector {
         Ok(())
     }
 
+    fn add_syscall_summary(&mut self, record: SyscallSummaryRecord) -> Result<()> {
+        self.data.syscall_summaries.push(record);
+        Ok(())
+    }
+
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()> {
         self.data.sysinfo = Some(record);
         Ok(())
@@ -746,6 +755,7 @@ mod tests {
                 add_task_stack_event(TaskStackEventRecord),
                 add_task_context(TaskContextRecord),
                 add_go_label(GoLabelRecord),
+                add_syscall_summary(SyscallSummaryRecord),
                 set_sysinfo(SysInfoRecord),
                 add_cpu_info(CpuInfoRecord),
                 add_tpu_device(TpuDeviceRecord),

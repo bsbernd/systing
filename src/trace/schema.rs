@@ -639,6 +639,21 @@ pub fn memory_vmstat_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Schema for syscall_summary.parquet
+pub fn syscall_summary_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("upid", DataType::Int64, false),
+        Field::new("utid", DataType::Int64, false),
+        Field::new("pid", DataType::Int32, false),
+        Field::new("tid", DataType::Int32, false),
+        Field::new("syscall_nr", DataType::Int32, false),
+        Field::new("syscall_name", DataType::Utf8, false),
+        Field::new("count", DataType::Int64, false),
+        Field::new("total_ns", DataType::Int64, false),
+        Field::new("max_ns", DataType::Int64, false),
+    ]))
+}
+
 // TPU profiling schemas
 
 /// Schema for tpu_device.parquet
