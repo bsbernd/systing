@@ -52,6 +52,7 @@ Available recorders:
 * `sched` - Scheduler event tracing (enabled by default)
 * `irq` - IRQ and softirq event tracing (enabled by default)
 * `syscalls` - Syscall tracing (disabled by default)
+* `syscall-summary` - Aggregated per-thread syscall counts and timing (disabled by default)
 * `sleep-stacks` - Sleep stack traces (enabled by default)
 * `cpu-stacks` - CPU perf stack traces (enabled by default)
 * `network` - Network connection state tracking (disabled by default) - Socket lifecycle and TCP state transitions
@@ -136,6 +137,7 @@ Available recorders:
   sched          - Scheduler event tracing (on by default)
   irq            - IRQ and softirq event tracing (on by default)
   syscalls       - Syscall tracing
+  syscall-summary - Aggregated per-thread syscall counts and timing
   sleep-stacks   - Sleep stack traces (on by default)
   cpu-stacks     - CPU perf stack traces (on by default)
   network        - Network traffic recording

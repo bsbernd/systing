@@ -143,6 +143,9 @@ struct Command {
     /// Enable syscall tracing (raw_syscalls:sys_enter and sys_exit tracepoints)
     #[arg(long)]
     syscalls: bool,
+    // Syscall-summary recording enabled state (set by recorder management, not a CLI flag)
+    #[arg(skip)]
+    syscall_summary: bool,
     // Memory recording enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     memory: bool,
@@ -317,6 +320,7 @@ impl From<Command> for Config {
             no_sched: cmd.no_sched,
             no_irq: cmd.no_irq,
             syscalls: cmd.syscalls,
+            syscall_summary: cmd.syscall_summary,
             markers: cmd.markers,
             marker_threshold: cmd.marker_threshold,
             marker_duration_threshold: cmd.marker_duration_threshold,
@@ -381,6 +385,7 @@ enum Selection {
 fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool, selection: Selection) {
     match recorder_name {
         "syscalls" => opts.syscalls = enable,
+        "syscall-summary" => opts.syscall_summary = enable,
         "sched" => opts.no_sched = !enable,
         "irq" => opts.no_irq = !enable,
         "sleep-stacks" => opts.no_sleep_stack_traces = !enable,
@@ -445,6 +450,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         opts.no_sched = true;
         opts.no_irq = true;
         opts.syscalls = false;
+        opts.syscall_summary = false;
         opts.no_sleep_stack_traces = true;
         opts.no_interruptible_stack_traces = true;
         opts.no_cpu_stack_traces = true;

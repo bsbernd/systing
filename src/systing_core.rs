@@ -489,6 +489,14 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             ringbuf_families: &["probe_ringbufs"],
         },
         RecorderInfo {
+            name: "syscall-summary",
+            description: "In-BPF syscall count/time aggregation",
+            default_enabled: false,
+            bpf_programs: SYSCALL_BPF_PROGRAMS,
+            // Aggregates into the syscall_stats map; emits no ringbuf events.
+            ringbuf_families: &[],
+        },
+        RecorderInfo {
             name: "sleep-stacks",
             description: "Sleep stack traces",
             default_enabled: true,
@@ -607,6 +615,7 @@ fn is_recorder_enabled(name: &str, opts: &Config) -> bool {
         "sched" => !opts.no_sched,
         "irq" => !opts.no_irq,
         "syscalls" => opts.syscalls,
+        "syscall-summary" => opts.syscall_summary,
         "sleep-stacks" => !opts.no_sleep_stack_traces,
         "interruptible-stacks" => !opts.no_interruptible_stack_traces,
         "cpu-stacks" => !opts.no_cpu_stack_traces,
@@ -1618,6 +1627,8 @@ pub struct Config {
     pub no_irq: bool,
     /// Enable syscall tracing
     pub syscalls: bool,
+    /// In-BPF syscall count/time aggregation (recorder-managed, no CLI flag)
+    pub syscall_summary: bool,
     /// Enable marker recording (faccessat2-based userspace markers)
     pub markers: bool,
     /// Stop tracing after this many marker instant events
@@ -1780,6 +1791,7 @@ impl Default for Config {
             no_sched: false,
             no_irq: false,
             syscalls: false,
+            syscall_summary: false,
             markers: false,
             marker_threshold: None,
             marker_duration_threshold: None,
@@ -3738,6 +3750,9 @@ fn configure_bpf_skeleton(
         if opts.syscalls {
             rodata.tool_config.collect_syscalls = 1;
         }
+        if opts.syscall_summary {
+            rodata.tool_config.collect_syscall_summary = 1;
+        }
 
         if opts.markers {
             use syscalls::Sysno;
@@ -3811,6 +3826,14 @@ fn configure_bpf_skeleton(
                     )
                 })?;
             }
+            continue;
+        }
+        // syscall-summary aggregation maps: referenced only behind the
+        // collect_syscall_summary rodata gate, so the verifier prunes the
+        // references (and their poisoned relocations) when the recorder is off.
+        if !opts.syscall_summary && (name == "syscall_enter" || name == "syscall_stats") {
+            map.set_autocreate(false)
+                .with_context(|| format!("Failed to disable autocreate for '{name}'"))?;
             continue;
         }
         // The IOMMU run-size histogram is referenced only by the iommu

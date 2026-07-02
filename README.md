@@ -129,6 +129,7 @@ This will display all available recorders and their default states:
 - `sched` - Scheduler event tracing (on by default)
 - `irq` - IRQ and softirq event tracing (on by default)
 - `syscalls` - Syscall tracing
+- `syscall-summary` - Aggregated per-thread syscall counts and timing (count/total/max)
 - `sleep-stacks` - Sleep stack traces for all sleep states (on by default)
 - `interruptible-stacks` - Interruptible sleep stack traces (on by default, requires sleep-stacks)
 - `cpu-stacks` - CPU perf stack traces (on by default)
