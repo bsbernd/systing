@@ -928,4 +928,44 @@ mod tests {
         assert!(opts.network_syscalls);
         assert!(opts.network_packets);
     }
+
+    /// `--add-recorder syscall-summary` must enable the summary recorder without
+    /// touching the per-call `syscalls` recorder, and vice-versa. The two feed
+    /// separate rodata gates, so cross-enabling would be a regression (double
+    /// work, or the wrong path recorded).
+    #[test]
+    fn add_recorder_syscall_summary_independent_of_syscalls() {
+        let mut opts = Command::parse_from(["systing", "--add-recorder", "syscall-summary"]);
+        process_recorder_options(&mut opts).unwrap();
+        let config = Config::from(opts);
+        assert!(config.syscall_summary, "syscall-summary should be enabled");
+        assert!(
+            !config.syscalls,
+            "syscall-summary must not enable the per-call syscalls recorder"
+        );
+
+        let mut opts = Command::parse_from(["systing", "--add-recorder", "syscalls"]);
+        process_recorder_options(&mut opts).unwrap();
+        let config = Config::from(opts);
+        assert!(config.syscalls, "syscalls should be enabled");
+        assert!(
+            !config.syscall_summary,
+            "syscalls must not enable the syscall-summary recorder"
+        );
+    }
+
+    /// `--only-recorder syscall-summary` disables the default recorders (e.g.
+    /// sched) and leaves exactly the summary recorder on.
+    #[test]
+    fn only_recorder_syscall_summary_disables_defaults() {
+        let mut opts = Command::parse_from(["systing", "--only-recorder", "syscall-summary"]);
+        process_recorder_options(&mut opts).unwrap();
+        let config = Config::from(opts);
+        assert!(config.syscall_summary, "syscall-summary should be enabled");
+        assert!(!config.syscalls, "syscalls should stay disabled");
+        assert!(
+            config.no_sched,
+            "only-recorder should disable the default sched recorder"
+        );
+    }
 }
