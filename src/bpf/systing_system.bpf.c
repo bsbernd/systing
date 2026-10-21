@@ -161,6 +161,8 @@ const volatile struct {
 	u32 packet_sample_rate; /* network-packets: keep 1 in N PACKETS of the
 				 * data-path event types (0 or 1 = every packet).
 				 * See packet_sample_keep(). */
+	u64 network_coalesce_ns; /* Longest span of one merged send/recv
+				  * network_event (0 = one event per call). */
 } tool_config = {};
 
 enum event_type {
@@ -355,6 +357,8 @@ struct network_event {
 	                   // directly, instead of inferring it from src_ip against the
 	                   // interface map — which cannot disambiguate loopback (every netns
 	                   // has 127.0.0.1). 0 when the sock pointer was unavailable.
+	u32 calls;         // Send/recv calls merged into this event
+	u64 call_ns;       // Time spent inside those calls
 };
 
 enum packet_event_type {
@@ -664,6 +668,17 @@ struct {
 	__type(value, struct network_recv_info);
 	__uint(max_entries, 10240);
 } pending_network_recvs SEC(".maps");
+
+/* Per thread, the merged send/recv record still taking calls. Not LRU: an
+ * evicted record loses its calls. Userspace reads the records left at stop. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u32); /* tid */
+	__type(value, struct network_event);
+	__uint(max_entries, 1 << 16);
+} network_coalesce_open SEC(".maps");
+
+static const struct network_event empty_network_event;
 
 struct epoll_poll_info {
 	u32 requested_events;
@@ -3226,6 +3241,107 @@ static __always_inline u64 read_sk_netns_inum(u64 sk_ptr)
 	return BPF_CORE_READ(sk, __sk_common.skc_net.net, ns.inum);
 }
 
+static int submit_network_event_copy(const struct network_event *record)
+{
+	long flags;
+	struct network_event *event = reserve_network_event(&flags);
+	int ret = 0;
+
+	if (!event) {
+		ret = handle_missed_event(MISSED_NETWORK_EVENT);
+		goto out;
+	}
+	__builtin_memcpy(event, record, sizeof(*event));
+	bpf_ringbuf_submit(event, flags);
+out:
+	return ret;
+}
+
+/*
+ * The thread's record in network_coalesce_open for this call, NULL when the
+ * map is full. *merged: the call was added to the record. Otherwise the record
+ * is zeroed for the caller to fill, after its old calls went to the ring buffer.
+ */
+static __always_inline struct network_event *coalesce_network_call(u32 tid, u64 socket_id,
+						   enum network_operation operation,
+						   u64 start_ts, u64 end_ts,
+						   u32 bytes, bool *merged)
+{
+	struct network_event *open = bpf_map_lookup_elem(&network_coalesce_open, &tid);
+
+	*merged = false;
+	if (!open) {
+		long err = bpf_map_update_elem(&network_coalesce_open, &tid,
+					       &empty_network_event, BPF_NOEXIST);
+		if (!err)
+			open = bpf_map_lookup_elem(&network_coalesce_open, &tid);
+		goto out;
+	}
+
+	u64 span_ns = end_ts - open->start_ts;
+	u64 merged_bytes = (u64)open->bytes + bytes;
+	bool matches = open->socket_id == socket_id &&
+		       open->operation == operation &&
+		       span_ns < tool_config.network_coalesce_ns &&
+		       merged_bytes <= 0xffffffffULL;
+
+	if (matches) {
+		open->end_ts = end_ts;
+		open->bytes = (u32)merged_bytes;
+		open->calls++;
+		open->call_ns += end_ts - start_ts;
+		*merged = true;
+		goto out;
+	}
+
+	submit_network_event_copy(open);
+	__builtin_memset(open, 0, sizeof(*open));
+out:
+	return open;
+}
+
+static __always_inline void read_send_buffer_state(struct network_event *event,
+						   struct network_send_info *info)
+{
+	// Read send buffer state from socket (TCP only)
+	if (info->protocol == NETWORK_TCP && info->sk_ptr) {
+		struct sock *sk = (struct sock *)info->sk_ptr;
+		int wmem_queued = 0;
+		int sndbuf = 0;
+		bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+		bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+		event->sndbuf_used = (u32)wmem_queued;
+		event->sndbuf_limit = (u32)sndbuf;
+	}
+}
+
+static __always_inline void fill_send_event(struct network_event *event,
+					    struct network_send_info *info,
+					    struct task_struct *task, int ret, u64 end_ts)
+{
+	event->start_ts = info->start_ts;
+	event->end_ts = end_ts;
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->protocol = info->protocol;
+	event->operation = NETWORK_SEND;
+	event->af = info->af;
+	__builtin_memcpy(event->src_addr, info->src_addr, 16);
+	event->src_port = info->src_port;
+	__builtin_memcpy(event->dest_addr, info->dest_addr, 16);
+	event->dest_port = info->dest_port;
+	event->bytes = (u32)ret;  // Return value is number of bytes sent
+	event->sendmsg_seq = info->sendmsg_seq;  // TCP sequence at sendmsg time
+
+	read_send_buffer_state(event, info);
+
+	// Copy socket_id for correlation
+	event->socket_id = info->socket_id;
+	event->netns_inum = read_sk_netns_inum(info->sk_ptr);
+	event->calls = 1;
+	event->call_ns = end_ts - info->start_ts;
+}
+
 static int handle_sendmsg_exit(void *ctx, int ret)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
@@ -3245,6 +3361,24 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 		return 0;
 	}
 
+	u64 end_ts = bpf_ktime_get_boot_ns();
+
+	if (tool_config.network_coalesce_ns) {
+		bool merged;
+		struct network_event *open =
+			coalesce_network_call((u32)tgidpid, info->socket_id, NETWORK_SEND,
+					      info->start_ts, end_ts, (u32)ret, &merged);
+
+		if (open) {
+			if (merged)
+				read_send_buffer_state(open, info);
+			else
+				fill_send_event(open, info, task, ret, end_ts);
+			bpf_map_delete_elem(&pending_network_sends, &tgidpid);
+			return 0;
+		}
+	}
+
 	long flags;
 	struct network_event *event = reserve_network_event(&flags);
 	if (!event) {
@@ -3252,35 +3386,7 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 		return handle_missed_event(MISSED_NETWORK_EVENT);
 	}
 
-	event->start_ts = info->start_ts;
-	event->end_ts = bpf_ktime_get_boot_ns();
-	event->cpu = bpf_get_smp_processor_id();
-	record_task_info(&event->task, task);
-	event->protocol = info->protocol;
-	event->operation = NETWORK_SEND;
-	event->af = info->af;
-	__builtin_memcpy(event->src_addr, info->src_addr, 16);
-	event->src_port = info->src_port;
-	__builtin_memcpy(event->dest_addr, info->dest_addr, 16);
-	event->dest_port = info->dest_port;
-	event->bytes = (u32)ret;  // Return value is number of bytes sent
-	event->sendmsg_seq = info->sendmsg_seq;  // TCP sequence at sendmsg time
-
-	// Read send buffer state from socket (TCP only)
-	if (info->protocol == NETWORK_TCP && info->sk_ptr) {
-		struct sock *sk = (struct sock *)info->sk_ptr;
-		int wmem_queued = 0;
-		int sndbuf = 0;
-		bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
-		bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
-		event->sndbuf_used = (u32)wmem_queued;
-		event->sndbuf_limit = (u32)sndbuf;
-	}
-
-	// Copy socket_id for correlation
-	event->socket_id = info->socket_id;
-	event->netns_inum = read_sk_netns_inum(info->sk_ptr);
-
+	fill_send_event(event, info, task, ret, end_ts);
 	bpf_ringbuf_submit(event, flags);
 	bpf_map_delete_elem(&pending_network_sends, &tgidpid);
 
@@ -3354,41 +3460,12 @@ static int handle_tcp_recvmsg_entry(struct sock *sk, struct msghdr *msg)
 	return 0;
 }
 
-static int handle_recvmsg_exit(void *ctx, int ret)
+static __always_inline void fill_recv_event(struct network_event *event,
+					    struct network_recv_info *info,
+					    struct task_struct *task, int ret, u64 end_ts)
 {
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
-
-	if (!trace_task(task))
-		return 0;
-
-	// Only record successful receives
-	if (ret <= 0)
-		return 0;
-
-	u64 tgidpid = bpf_get_current_pid_tgid();
-	struct network_recv_info *info = bpf_map_lookup_elem(&pending_network_recvs, &tgidpid);
-
-	if (!info) {
-		// No matching entry, skip
-		return 0;
-	}
-
-	// For UDP: skip if peer address wasn't successfully extracted (peer_port will be 0)
-	// This can happen if __skb_recv_udp returned NULL
-	if (info->protocol == NETWORK_UDP && info->peer_port == 0) {
-		bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
-		return 0;
-	}
-
-	long flags;
-	struct network_event *event = reserve_network_event(&flags);
-	if (!event) {
-		bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
-		return handle_missed_event(MISSED_NETWORK_EVENT);
-	}
-
 	event->start_ts = info->start_ts;
-	event->end_ts = bpf_ktime_get_boot_ns();
+	event->end_ts = end_ts;
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
 	event->protocol = info->protocol;
@@ -3420,7 +3497,62 @@ static int handle_recvmsg_exit(void *ctx, int ret)
 		event->recv_seq_end = 0;
 		event->rcv_nxt_at_entry = 0;
 	}
+	event->calls = 1;
+	event->call_ns = end_ts - info->start_ts;
+}
 
+static int handle_recvmsg_exit(void *ctx, int ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	// Only record successful receives
+	if (ret <= 0)
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct network_recv_info *info = bpf_map_lookup_elem(&pending_network_recvs, &tgidpid);
+
+	if (!info) {
+		// No matching entry, skip
+		return 0;
+	}
+
+	// For UDP: skip if peer address wasn't successfully extracted (peer_port will be 0)
+	// This can happen if __skb_recv_udp returned NULL
+	if (info->protocol == NETWORK_UDP && info->peer_port == 0) {
+		bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
+		return 0;
+	}
+
+	u64 end_ts = bpf_ktime_get_boot_ns();
+
+	if (tool_config.network_coalesce_ns) {
+		bool merged;
+		struct network_event *open =
+			coalesce_network_call((u32)tgidpid, info->socket_id, NETWORK_RECV,
+					      info->start_ts, end_ts, (u32)ret, &merged);
+
+		if (open) {
+			if (!merged)
+				fill_recv_event(open, info, task, ret, end_ts);
+			else if (info->protocol == NETWORK_TCP)
+				open->recv_seq_end = info->recv_seq_start + (u32)ret;
+			bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
+			return 0;
+		}
+	}
+
+	long flags;
+	struct network_event *event = reserve_network_event(&flags);
+	if (!event) {
+		bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
+		return handle_missed_event(MISSED_NETWORK_EVENT);
+	}
+
+	fill_recv_event(event, info, task, ret, end_ts);
 	bpf_ringbuf_submit(event, flags);
 	bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
 

@@ -389,6 +389,8 @@ pub struct NetworkSyscallRecord {
     pub recv_seq_end: Option<i64>,
     pub rcv_nxt: Option<i64>,
     pub bytes_available: Option<i64>,
+    pub calls: i64,
+    pub call_ns: i64,
 }
 
 /// Network packet record - represents packet-level events with flattened fields.

@@ -610,6 +610,8 @@ impl NetworkRecorder {
             recv_seq_end: None,
             rcv_nxt: None,
             bytes_available: None,
+            calls: event.calls as i64,
+            call_ns: event.call_ns as i64,
         };
 
         if is_send {
@@ -968,6 +970,21 @@ impl NetworkRecorder {
 
         if count > 0 {
             tracing::info!("Loaded {} socket metadata entries from BPF map", count);
+        }
+    }
+
+    /// Write the merged send/recv records the BPF map still holds at stop.
+    pub fn flush_open_records<M: libbpf_rs::MapCore>(&mut self, map: &M) {
+        for key in map.keys() {
+            if let Ok(Some(value_bytes)) = map.lookup(&key, libbpf_rs::MapFlags::ANY) {
+                if value_bytes.len() >= std::mem::size_of::<network_event>() {
+                    // SAFETY: the map's value type is network_event, a Plain struct.
+                    let event: network_event = unsafe {
+                        std::ptr::read_unaligned(value_bytes.as_ptr() as *const network_event)
+                    };
+                    self.handle_event(event);
+                }
+            }
         }
     }
 

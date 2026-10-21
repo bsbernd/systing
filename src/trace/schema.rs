@@ -373,6 +373,8 @@ pub fn network_syscall_schema() -> Arc<Schema> {
         Field::new("recv_seq_end", DataType::Int64, true),
         Field::new("rcv_nxt", DataType::Int64, true),
         Field::new("bytes_available", DataType::Int64, true),
+        Field::new("calls", DataType::Int64, false),
+        Field::new("call_ns", DataType::Int64, false),
     ]))
 }
 

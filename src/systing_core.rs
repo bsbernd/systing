@@ -459,6 +459,16 @@ const NETWORK_SYSCALLS_BPF_PROGRAMS: &[&str] = &[
     "tracepoint__skb__kfree_skb",
 ];
 
+/// `tool_config.network_coalesce_ns`: 0 unless a recorder loading the
+/// sendmsg/recvmsg probes runs.
+fn network_coalesce_ns(opts: &Config) -> u64 {
+    if opts.network_packets || opts.network_syscalls {
+        opts.network_coalesce_us.saturating_mul(1000)
+    } else {
+        0
+    }
+}
+
 // Marker recording reuses the syscall tracepoints.
 const MARKER_BPF_PROGRAMS: &[&str] = SYSCALL_BPF_PROGRAMS;
 
@@ -1693,6 +1703,9 @@ pub struct Config {
     /// plus retransmit/drop/stall diagnostics, without the per-packet probes.
     /// Never enabled implicitly; name it.
     pub network_syscalls: bool,
+    /// Longest span of one network_syscall row merging a thread's
+    /// consecutive send (or recv) calls on one socket; 0 = one row per call.
+    pub network_coalesce_us: u64,
     /// Under [`KernelHooks::Trampoline`], make the trampoline (fentry) form
     /// of the TIME_WAIT hooks fail at attach after its first program
     /// attached, so the capture takes the attach-time fallback to the kprobe
@@ -1812,6 +1825,7 @@ impl Default for Config {
             network_packets: false,
             packet_sample_rate: 1,
             network_syscalls: false,
+            network_coalesce_us: 1000,
             network_tw_force_fallback: false,
             resolve_addresses: false,
             tpu_profile: false,
@@ -3786,6 +3800,7 @@ fn configure_bpf_skeleton(
             // records every packet as before.
             rodata.tool_config.packet_sample_rate = opts.packet_sample_rate;
         }
+        rodata.tool_config.network_coalesce_ns = network_coalesce_ns(opts);
 
         // Rings per family and the wakeup threshold (half a ring, so
         // consumers batch) come from the plan; see plan_ringbufs.
@@ -3832,6 +3847,12 @@ fn configure_bpf_skeleton(
         // collect_syscall_summary rodata gate, so the verifier prunes the
         // references (and their poisoned relocations) when the recorder is off.
         if !opts.syscall_summary && (name == "syscall_enter" || name == "syscall_stats") {
+            map.set_autocreate(false)
+                .with_context(|| format!("Failed to disable autocreate for '{name}'"))?;
+            continue;
+        }
+        // Referenced only behind the network_coalesce_ns rodata gate.
+        if name == "network_coalesce_open" && network_coalesce_ns(opts) == 0 {
             map.set_autocreate(false)
                 .with_context(|| format!("Failed to disable autocreate for '{name}'"))?;
             continue;
@@ -6970,6 +6991,16 @@ pub fn systing(
                 .lock()
                 .unwrap()
                 .load_socket_metadata(&skel.maps.socket_metadata_map);
+        }
+        // The tracing gate is off and the consumers are joined, so the BPF
+        // programs no longer change these records.
+        if network_coalesce_ns(&opts) > 0 {
+            let _p = stop_phase("write open network records");
+            recorder
+                .network_recorder
+                .lock()
+                .unwrap()
+                .flush_open_records(&skel.maps.network_coalesce_open);
         }
         // Read the in-BPF syscall aggregation while skel (and its maps) is alive.
         if opts.syscall_summary {

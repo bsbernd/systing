@@ -234,6 +234,12 @@ network` is state-only and `--only-recorder network-syscalls` is the shape
 for continuous or fleet-wide profiling, where per-packet volume is
 prohibitive but per-connection throughput still matters.
 
+Both `network-syscalls` and `network-packets` merge consecutive send calls
+(or receive calls) of one thread on one socket into one `network_syscall`
+row covering at most `--network-coalesce-us` microseconds (default 1000).
+The row's `calls` column gives the number of calls it holds. Use
+`--network-coalesce-us 0` for one row per call.
+
 ```bash
 # Enable network recording (connection state + packet-level)
 sudo ./target/debug/systing --add-recorder network --duration 60

@@ -144,6 +144,14 @@ Available recorders:
   pystacks       - Python stack tracing
 ----
 
+=== *--network-coalesce-us* _MICROSECONDS_
+
+With the *network-syscalls* or *network-packets* recorder, merge consecutive successful sendmsg calls (or recvmsg calls) of one thread on one socket into one `network_syscall` row.
+A row covers at most this many microseconds, from the start of its first call to the end of its last.
+The row's `bytes` is the sum over its calls, `calls` is the number of calls, and `call_ns` is the time spent inside them.
+Default: 1000.
+0 writes one row per call.
+
 === *--no-cpu-stack-traces*
 
 Do not record the `perf` style stack traces for tasks while they're running.

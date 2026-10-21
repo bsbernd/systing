@@ -194,6 +194,9 @@ struct Command {
     // Network syscall-level probes (set by recorder management, not a CLI flag)
     #[arg(skip)]
     network_syscalls: bool,
+    /// With the network-syscalls or network-packets recorder, merge a thread's consecutive successful sendmsg (or recvmsg) calls on one socket into one network_syscall row spanning at most this many microseconds (0 = one row per call). The row's `calls` and `call_ns` columns give the number of calls and the time spent inside them. Without merging, a host doing many small sends loses most of these events (`Missed network events` in the exit summary).
+    #[arg(long, default_value = "1000")]
+    network_coalesce_us: u64,
     // Marker recording enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     markers: bool,
@@ -345,6 +348,7 @@ impl From<Command> for Config {
             network_packets: cmd.network_packets,
             packet_sample_rate: cmd.packet_sample_rate,
             network_syscalls: cmd.network_syscalls,
+            network_coalesce_us: cmd.network_coalesce_us,
             // Testing-only; never a CLI flag (the agent's argv cannot reach it).
             network_tw_force_fallback: false,
             resolve_addresses: cmd.resolve_addresses,

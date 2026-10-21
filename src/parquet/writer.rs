@@ -2874,6 +2874,8 @@ fn build_network_syscall_batch(
     let mut recv_seq_end_builder = Int64Builder::with_capacity(records.len());
     let mut rcv_nxt_builder = Int64Builder::with_capacity(records.len());
     let mut bytes_available_builder = Int64Builder::with_capacity(records.len());
+    let mut calls_builder = Int64Builder::with_capacity(records.len());
+    let mut call_ns_builder = Int64Builder::with_capacity(records.len());
 
     for record in records {
         id_builder.append_value(record.id);
@@ -2891,6 +2893,8 @@ fn build_network_syscall_batch(
         recv_seq_end_builder.append_option(record.recv_seq_end);
         rcv_nxt_builder.append_option(record.rcv_nxt);
         bytes_available_builder.append_option(record.bytes_available);
+        calls_builder.append_value(record.calls);
+        call_ns_builder.append_value(record.call_ns);
     }
 
     Ok(RecordBatch::try_new(
@@ -2911,6 +2915,8 @@ fn build_network_syscall_batch(
             Arc::new(recv_seq_end_builder.finish()),
             Arc::new(rcv_nxt_builder.finish()),
             Arc::new(bytes_available_builder.finish()),
+            Arc::new(calls_builder.finish()),
+            Arc::new(call_ns_builder.finish()),
         ],
     )?)
 }
