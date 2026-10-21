@@ -445,6 +445,24 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 33 (systing 1.30.0) — 2026-10-21
+
+The network-syscalls and network-packets recorders merge consecutive send
+calls (or receive calls) of one thread on one socket into one
+`network_syscall` row spanning at most `--network-coalesce-us` microseconds
+(default 1000; 0 = one row per call).
+
+### Added columns
+- `network_syscall`: added `calls BIGINT` — the number of calls the row merges.
+  `bytes` is their sum; `ts` is the first call's start and `ts + dur` the last
+  call's end. `seq` and `recv_seq_start` come from the first call,
+  `recv_seq_end` and `sndbuf_used`/`sndbuf_limit` from the last.
+- `network_syscall`: added `call_ns BIGINT` — the time spent inside those
+  calls; `dur` also covers the time between them.
+
+Older databases import cleanly: both columns are `NULL`, which means one call
+per row.
+
 ## Schema Version 32 (systing 1.29.0) — 2026-10-21
 
 Added the `syscall_summary` table for the new `syscall-summary` recorder, which

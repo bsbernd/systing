@@ -918,7 +918,8 @@ network activity, and performance counters. Traces are stored in DuckDB database
 - counter: Performance counter values over time.
 - cpu_info: Per-CPU static frequency limits in kHz (min/max/base) from sysfs \
   cpufreq; empty on systems without cpufreq support (typical VMs).
-- network_syscall: Network send/recv syscalls with bytes and buffer metrics.
+- network_syscall: Network send/recv syscalls with bytes and buffer metrics; one row \
+  merges `calls` consecutive calls (NULL before schema 33 = 1).
 - network_packet: Packet-level events (TCP/UDP) with sequence numbers, \
   retransmits, RTT, drops.
 - network_socket: Socket metadata (protocol, src/dest IP:port).

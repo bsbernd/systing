@@ -42,6 +42,8 @@ Network syscall events (sendmsg/recvmsg) with duration.
 | recv_seq_end | BIGINT | Yes | TCP recv: copied_seq at exit |
 | rcv_nxt | BIGINT | Yes | TCP recv: next expected sequence |
 | bytes_available | BIGINT | Yes | TCP recv: data buffered in kernel |
+| calls | BIGINT | Yes | Send/recv calls merged into this row (schema 33+; NULL = 1) |
+| call_ns | BIGINT | Yes | Time spent inside those calls, nanoseconds (schema 33+) |
 
 ### `network_packet`
 

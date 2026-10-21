@@ -134,7 +134,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 32;
+pub const SCHEMA_VERSION: u32 = 33;
 
 /// The systing version that writes `_traces.systing_version`. A constant so
 /// the tools built on the library (`systing-heap`) record the same version
@@ -573,7 +573,9 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             recv_seq_start BIGINT,
             recv_seq_end BIGINT,
             rcv_nxt BIGINT,
-            bytes_available BIGINT
+            bytes_available BIGINT,
+            calls BIGINT,
+            call_ns BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS network_packet (
