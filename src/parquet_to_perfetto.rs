@@ -2285,6 +2285,13 @@ impl ParquetToPerfettoConverter {
                     .column_by_name("utid")
                     .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
                     .context("Missing utid column in network_syscall")?;
+                // Absent in traces recorded before schema 33.
+                let calls_col = batch
+                    .column_by_name("calls")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+                let call_ns_col = batch
+                    .column_by_name("call_ns")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
 
                 for i in 0..batch.num_rows() {
                     let ts = timestamps.value(i);
@@ -2327,6 +2334,19 @@ impl ParquetToPerfettoConverter {
                     socket_ann.set_name("socket_id".to_string());
                     socket_ann.set_int_value(socket_id);
                     begin_event.debug_annotations.push(socket_ann);
+
+                    if let Some(calls) = calls_col {
+                        let mut calls_ann = DebugAnnotation::default();
+                        calls_ann.set_name("calls".to_string());
+                        calls_ann.set_int_value(calls.value(i));
+                        begin_event.debug_annotations.push(calls_ann);
+                    }
+                    if let Some(call_ns) = call_ns_col {
+                        let mut call_ns_ann = DebugAnnotation::default();
+                        call_ns_ann.set_name("call_ns".to_string());
+                        call_ns_ann.set_int_value(call_ns.value(i));
+                        begin_event.debug_annotations.push(call_ns_ann);
+                    }
 
                     let mut begin_packet = TracePacket::default();
                     begin_packet.set_timestamp(ts as u64);
