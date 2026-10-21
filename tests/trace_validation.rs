@@ -2303,6 +2303,161 @@ fn test_e2e_network_coalesce_off() {
     );
 }
 
+/// The CPUs this process may run on.
+fn allowed_cpus() -> Vec<usize> {
+    // SAFETY: cpu_set_t is plain data, and the size passed is its size.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let rc =
+        unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+    assert_eq!(rc, 0, "sched_getaffinity failed");
+    let mut cpus = Vec::new();
+    for cpu in 0..libc::CPU_SETSIZE as usize {
+        if unsafe { libc::CPU_ISSET(cpu, &set) } {
+            cpus.push(cpu);
+        }
+    }
+    cpus
+}
+
+fn pin_current_thread(cpu: usize) {
+    // SAFETY: cpu_set_t is plain data, and the size passed is its size.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::CPU_SET(cpu, &mut set) };
+    let rc = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+    assert_eq!(rc, 0, "sched_setaffinity to CPU {cpu} failed");
+}
+
+/// The rps_cpus mask of one CPU: hex, with a comma between 32-bit words.
+fn rps_mask(cpu: usize) -> String {
+    let mut words = Vec::new();
+    for word in (0..=cpu / 32).rev() {
+        let bits: u32 = if word == cpu / 32 { 1 << (cpu % 32) } else { 0 };
+        words.push(format!("{bits:08x}"));
+    }
+    words.join(",")
+}
+
+/// RPS sends the veth receive work to a CPU that otherwise runs only a 1 ms
+/// sleeper. That work runs in the idle task and must be in the trace: NET_RX
+/// softirq slices inside idle sched slices, and idle-task stacks with
+/// net_rx_action.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_idle_cpu_interrupts() {
+    use std::net::UdpSocket;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
+
+    const NET_RX_SOFTIRQ: i32 = 3;
+    // Nothing listens on this port. The namespace answers with ICMP.
+    const DISCARD_PORT: u16 = 9;
+
+    let cpus = allowed_cpus();
+    if cpus.len() < 2 {
+        eprintln!(
+            "SKIP: test_e2e_idle_cpu_interrupts needs 2 CPUs, has {}",
+            cpus.len()
+        );
+        return;
+    }
+    let sender_cpu = cpus[0];
+    let idle_cpu = cpus[cpus.len() - 1];
+
+    let netns_env = NetnsTestEnv::new(NetworkTestConfig::default())
+        .expect("Failed to create network namespace test environment");
+    let rps_path = format!("/sys/class/net/{}/queues/rx-0/rps_cpus", netns_env.ns_veth);
+    let set_rps = format!("echo {} > {rps_path}", rps_mask(idle_cpu));
+    let output = netns_env
+        .run_in_ns("sh", &["-c", &set_rps])
+        .expect("Failed to run sh in the namespace");
+    assert!(
+        output.status.success(),
+        "Failed to set {rps_path}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Only a task switch on idle_cpu writes the idle time as a sched_slice
+    // row. The sleeper switches every millisecond.
+    let sleeper = stoppable_workload(move |stop| {
+        pin_current_thread(idle_cpu);
+        while !stop.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let dest = (netns_env.config.ns_ip, DISCARD_PORT);
+    // Bursts with pauses: a steady flood would move NET_RX to ksoftirqd.
+    let sender = stoppable_workload(move |stop| {
+        pin_current_thread(sender_cpu);
+        let socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to bind UDP socket");
+        let payload = [0u8; 64];
+        while !stop.load(Ordering::Relaxed) {
+            for _ in 0..32 {
+                let _ = socket.send_to(&payload, dest);
+            }
+            thread::sleep(Duration::from_micros(200));
+        }
+    });
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let config = Config {
+        duration: NETWORK_SUITE_DURATION_SECS,
+        parquet_only: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+    eprintln!(
+        "Recording trace ({NETWORK_SUITE_DURATION_SECS}s, RPS to CPU {idle_cpu}, sender on CPU {sender_cpu})..."
+    );
+    let recorded = systing(config, None);
+    sender.stop();
+    sleeper.stop();
+    drop(netns_env);
+    recorded.expect("systing recording failed");
+
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "idle")
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    let idle_softirqs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM softirq_slice s
+             WHERE s.cpu = ? AND s.vec = ? AND EXISTS (
+                 SELECT 1 FROM sched_slice ss JOIN thread t ON t.utid = ss.utid
+                 WHERE t.tid = 0 AND ss.cpu = s.cpu
+                   AND s.ts >= ss.ts AND s.ts < ss.ts + ss.dur)",
+            [idle_cpu as i64, NET_RX_SOFTIRQ as i64],
+            |row| row.get(0),
+        )
+        .expect("softirq_slice query failed");
+    let idle_stacks: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM stack_sample ss JOIN stack s ON s.id = ss.stack_id
+             WHERE ss.cpu = ?
+               AND ss.utid IN (SELECT utid FROM thread WHERE tid = 0)
+               AND EXISTS (SELECT 1 FROM frame f
+                           WHERE list_contains(s.frame_ids, f.id)
+                             AND f.name LIKE '%net_rx_action%')",
+            [idle_cpu as i64],
+            |row| row.get(0),
+        )
+        .expect("stack_sample query failed");
+    eprintln!(
+        "    CPU {idle_cpu}: {idle_softirqs} NET_RX slices in idle, {idle_stacks} idle stacks with net_rx_action"
+    );
+
+    assert!(
+        idle_softirqs > 0,
+        "[idle cpu] no NET_RX softirq_slice inside an idle sched_slice on CPU {idle_cpu}"
+    );
+    assert!(
+        idle_stacks > 0,
+        "[idle cpu] no idle-task stack_sample with net_rx_action on CPU {idle_cpu}"
+    );
+}
+
 /// One network capture over a TCP connect/close workload with the opt-in
 /// trampoline form of the TIME_WAIT leg (`kernel_hooks: Trampoline`), with
 /// the testing-only attach-failure switch on or off. Returns the trace's
