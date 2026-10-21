@@ -2131,6 +2131,178 @@ fn test_e2e_network_packet_sample_rate() {
     );
 }
 
+/// Bytes per write of the coalescing workload's sender.
+const COALESCE_SEND_BYTES: usize = 1024;
+
+/// Per sendmsg row of the coalescing workload's client socket: row count,
+/// summed calls, summed bytes, rows with `calls` or `call_ns` out of range for
+/// the window, and rows whose utid is not in `thread`.
+struct CoalesceRows {
+    rows: i64,
+    calls: i64,
+    bytes: i64,
+    bad: i64,
+    orphaned: i64,
+}
+
+/// One network-syscalls capture with `network_coalesce_us` while a thread
+/// writes bursts of COALESCE_SEND_BYTES messages over loopback TCP. The
+/// trace is also converted to Perfetto, which fails on a malformed row.
+fn record_coalesce_capture(dir: &TempDir, network_coalesce_us: u64) -> CoalesceRows {
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind traffic listener");
+    let port = listener.local_addr().unwrap().port();
+    let traffic = stoppable_workload(move |stop| {
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("Failed to connect");
+        let (mut server, _) = listener.accept().expect("Failed to accept");
+        let reader = thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            while let Ok(read) = server.read(&mut buf) {
+                if read == 0 {
+                    break;
+                }
+            }
+        });
+        let msg = [0u8; COALESCE_SEND_BYTES];
+        // 100 back-to-back writes take well under the 1 ms default window; the
+        // pause keeps the per-call capture (window 0) at a few 100k rows.
+        while !stop.load(Ordering::Relaxed) {
+            for _ in 0..100 {
+                client.write_all(&msg).expect("loopback write failed");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(client);
+        reader.join().expect("reader thread panicked");
+    });
+
+    let config = Config {
+        duration: NETWORK_SUITE_DURATION_SECS,
+        network: true,
+        network_syscalls: true,
+        network_coalesce_us,
+        parquet_only: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+    eprintln!(
+        "Recording trace ({}s, network-syscalls, --network-coalesce-us {network_coalesce_us})...",
+        NETWORK_SUITE_DURATION_SECS
+    );
+    let recorded = systing(config, None);
+    traffic.stop();
+    recorded.expect("systing recording (network-syscalls) failed");
+
+    systing::parquet_to_perfetto::convert(dir.path(), &dir.path().join("trace.pb"))
+        .expect("Perfetto conversion failed");
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "coalesce")
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    // A row out of range: no calls, more time inside the calls than the row
+    // spans, a merged row spanning the window (one blocking call may exceed
+    // it), or with window 0 more than one call or time between calls.
+    let window_check = if network_coalesce_us == 0 {
+        "calls <> 1 OR call_ns <> dur"
+    } else {
+        "calls < 1 OR call_ns > dur OR (calls > 1 AND dur >= ? * 1000)"
+    };
+    let sql = format!(
+        "SELECT COUNT(*), CAST(COALESCE(SUM(calls), 0) AS BIGINT),
+                CAST(COALESCE(SUM(bytes), 0) AS BIGINT),
+                COUNT(*) FILTER (WHERE {window_check}),
+                COUNT(*) FILTER (WHERE utid NOT IN (SELECT utid FROM thread))
+         FROM network_syscall
+         WHERE event_type = 'sendmsg' AND socket_id IN
+               (SELECT socket_id FROM network_socket WHERE protocol = 'TCP' AND dest_port = {port})"
+    );
+    let read_row = |row: &duckdb::Row| -> duckdb::Result<CoalesceRows> {
+        Ok(CoalesceRows {
+            rows: row.get(0)?,
+            calls: row.get(1)?,
+            bytes: row.get(2)?,
+            bad: row.get(3)?,
+            orphaned: row.get(4)?,
+        })
+    };
+    let result = if network_coalesce_us == 0 {
+        conn.query_row(&sql, [], read_row)
+    } else {
+        conn.query_row(&sql, [network_coalesce_us as i64], read_row)
+    };
+    let rows = result.expect("network_syscall query failed");
+    eprintln!(
+        "    {} sendmsg rows, {} calls, {} bytes, {} out of range, {} orphaned",
+        rows.rows, rows.calls, rows.bytes, rows.bad, rows.orphaned
+    );
+    rows
+}
+
+/// The default window merges the sender's back-to-back writes: fewer rows
+/// than calls, and the bytes still add up to every call's write.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_network_coalesce() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let rows = record_coalesce_capture(&dir, Config::default().network_coalesce_us);
+
+    assert!(
+        rows.rows > 0,
+        "[coalesce] no sendmsg rows for the workload's socket"
+    );
+    assert!(
+        rows.rows < rows.calls,
+        "[coalesce] {} rows for {} calls: back-to-back writes must share rows",
+        rows.rows,
+        rows.calls
+    );
+    assert_eq!(
+        rows.bytes,
+        rows.calls * COALESCE_SEND_BYTES as i64,
+        "[coalesce] a merged row's bytes must be the sum of its calls' writes"
+    );
+    assert_eq!(
+        rows.bad, 0,
+        "[coalesce] rows with calls or call_ns out of range"
+    );
+    assert_eq!(
+        rows.orphaned, 0,
+        "[coalesce] rows whose utid is not in thread"
+    );
+}
+
+/// `--network-coalesce-us 0` writes one row per call.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_network_coalesce_off() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let rows = record_coalesce_capture(&dir, 0);
+
+    assert!(
+        rows.rows > 0,
+        "[coalesce off] no sendmsg rows for the workload's socket"
+    );
+    assert_eq!(
+        rows.bad, 0,
+        "[coalesce off] rows with calls <> 1 or call_ns <> dur"
+    );
+    assert_eq!(
+        rows.bytes,
+        rows.rows * COALESCE_SEND_BYTES as i64,
+        "[coalesce off] every row must be one write"
+    );
+    assert_eq!(
+        rows.orphaned, 0,
+        "[coalesce off] rows whose utid is not in thread"
+    );
+}
+
 /// One network capture over a TCP connect/close workload with the opt-in
 /// trampoline form of the TIME_WAIT leg (`kernel_hooks: Trampoline`), with
 /// the testing-only attach-failure switch on or off. Returns the trace's
