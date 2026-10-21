@@ -1873,6 +1873,14 @@ static bool trace_task_btf(struct task_struct *task)
 	return trace_task_common(task) && task_in_target_set(task);
 }
 
+/* Interrupts on an idle CPU run in the idle task. The idle task belongs to
+ * no --pid or --cgroup target, so it is traced only without one. */
+static bool idle_task_traced(struct task_struct *task)
+{
+	return tracing_enabled && task->tgid == 0 &&
+	       !target_filter.filter_pid && !target_filter.filter_cgroup;
+}
+
 static int handle_missed_event(u32 index)
 {
 	u64 *value = bpf_map_lookup_elem(&missed_events, &index);
@@ -2109,7 +2117,7 @@ static int trace_irq_event(struct irqaction *action, int irq, int ret, bool ente
 		return 0;
 
 	tsk = (struct task_struct *)bpf_get_current_task_btf();
-	if (!trace_task(tsk))
+	if (!trace_task(tsk) && !idle_task_traced(tsk))
 		return 0;
 
 	struct task_event *event;
@@ -2145,7 +2153,7 @@ static int trace_softirq_event(unsigned int vec_nr, bool enter)
 		return 0;
 
 	tsk = (struct task_struct *)bpf_get_current_task_btf();
-	if (!trace_task(tsk))
+	if (!trace_task(tsk) && !idle_task_traced(tsk))
 		return 0;
 
 	struct task_event *event;
