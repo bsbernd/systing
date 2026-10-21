@@ -840,6 +840,15 @@ struct {
 	__uint(max_entries, 1);
 } cpu_running_pid SEC(".maps");
 
+/* IRQ handlers and softirqs running on this CPU. A count, not a flag: a
+ * hardirq can interrupt a softirq. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, u32);
+	__uint(max_entries, 1);
+} cpu_interrupt_depth SEC(".maps");
+
 /*
  * Inner-ring TEMPLATES for the eight per-CPU-sharded ring families. These
  * types are only the `__array(values, ...)` template of each outer
@@ -1881,6 +1890,32 @@ static bool idle_task_traced(struct task_struct *task)
 	       !target_filter.filter_pid && !target_filter.filter_cgroup;
 }
 
+/* Only the irq recorder's programs count cpu_interrupt_depth, so without
+ * them this is false. */
+static bool idle_task_in_interrupt(struct task_struct *task)
+{
+	u32 key = 0;
+	u32 *depth;
+
+	if (!idle_task_traced(task))
+		return false;
+	depth = bpf_map_lookup_elem(&cpu_interrupt_depth, &key);
+	return depth && *depth > 0;
+}
+
+static void update_interrupt_depth(bool enter)
+{
+	u32 key = 0;
+	u32 *depth = bpf_map_lookup_elem(&cpu_interrupt_depth, &key);
+
+	if (!depth)
+		return;
+	if (enter)
+		*depth += 1;
+	else if (*depth > 0) /* 0: the capture started inside the handler */
+		*depth -= 1;
+}
+
 static int handle_missed_event(u32 index)
 {
 	u64 *value = bpf_map_lookup_elem(&missed_events, &index);
@@ -1975,7 +2010,9 @@ static void emit_stack_event_with_ts(void *ctx, struct task_struct *task,
 	if (tool_config.no_stack_traces)
 		return;
 
-	if (!trace_task(task))
+	/* Idle-task samples are kept only inside an IRQ handler or a softirq. */
+	if (!trace_task(task) &&
+	    !(type == STACK_RUNNING && idle_task_in_interrupt(task)))
 		return;
 
 	/*
@@ -2116,6 +2153,7 @@ static int trace_irq_event(struct irqaction *action, int irq, int ret, bool ente
 	if (tool_config.no_irq)
 		return 0;
 
+	update_interrupt_depth(enter);
 	tsk = (struct task_struct *)bpf_get_current_task_btf();
 	if (!trace_task(tsk) && !idle_task_traced(tsk))
 		return 0;
@@ -2152,6 +2190,7 @@ static int trace_softirq_event(unsigned int vec_nr, bool enter)
 	if (tool_config.no_irq)
 		return 0;
 
+	update_interrupt_depth(enter);
 	tsk = (struct task_struct *)bpf_get_current_task_btf();
 	if (!trace_task(tsk) && !idle_task_traced(tsk))
 		return 0;

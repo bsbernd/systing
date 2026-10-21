@@ -162,6 +162,9 @@ Disable IRQ and softirq event tracing (the `irq_handler_entry`/`irq_handler_exit
 IRQ events cannot meaningfully be narrowed by *-p* (nearly every IRQ interrupts _some_ traced task on a busy host), so on large machines they can dominate a pid-scoped trace; this flag sheds that load independently of the scheduler recorder.
 Equivalent to leaving `irq` out of an *--only-recorder* list.
 
+Without *-p* and *--cgroup*, the trace has the interrupts that run on an idle CPU, and CPU stack samples taken during them, as thread 0.
+*--no-irq* drops those stack samples too: the IRQ and softirq programs tell the stack sampler when an interrupt is running.
+
 Note: before the `irq` recorder was split out, these tracepoints were part of the `sched` recorder and *--no-sched* disabled them too.
 *--no-sched* no longer affects IRQ tracing; use *--no-irq* (or recorder selection) for that.
 
